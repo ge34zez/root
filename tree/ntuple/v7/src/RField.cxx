@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <cctype> // for isspace
+#include <charconv>
 #include <cstdint>
 #include <cstdlib> // for malloc, free
 #include <cstring> // for memset
@@ -115,6 +116,31 @@ std::vector<std::string> TokenizeTypeList(std::string templateType) {
    return result;
 }
 
+/// Parse a type name of the form `T[n][m]...` and return the base type `T` and a vector that contains,
+/// in order, the declared size for each dimension, e.g. for `unsigned char[1][2][3]` it returns the tuple
+/// `{"unsigned char", {1, 2, 3}}`. Extra whitespace in `typeName` should be removed before calling this function.
+///
+/// If `typeName` is not an array type, it returns a tuple `{T, {}}`. On error, it returns a default-constructed tuple.
+std::tuple<std::string, std::vector<size_t>> ParseArrayType(std::string_view typeName)
+{
+   std::vector<size_t> sizeVec;
+
+   /// Only parse outer array definition, i.e. the right `]` should be at the end of the type name
+   while (typeName.back() == ']') {
+      auto posRBrace = typeName.size() - 1;
+      auto posLBrace = typeName.find_last_of("[", posRBrace);
+      if (posLBrace == std::string_view::npos)
+         return {};
+
+      size_t size;
+      if (std::from_chars(typeName.data() + posLBrace + 1, typeName.data() + posRBrace, size).ec != std::errc{})
+         return {};
+      sizeVec.insert(sizeVec.begin(), size);
+      typeName.remove_suffix(typeName.size() - posLBrace);
+   }
+   return std::make_tuple(std::string{typeName}, sizeVec);
+}
+
 std::string GetNormalizedType(const std::string &typeName) {
    std::string normalizedType(
       TClassEdit::ResolveTypedef(TClassEdit::CleanType(typeName.c_str(),
@@ -172,6 +198,14 @@ ROOT::Experimental::Detail::RFieldBase::Create(const std::string &fieldName, con
       return R__FAIL("no type name specified for Field " + fieldName);
 
    std::unique_ptr<ROOT::Experimental::Detail::RFieldBase> result;
+
+   if (auto [arrayBaseType, arraySize] = ParseArrayType(normalizedType); !arraySize.empty()) {
+      // TODO(jalopezg): support multi-dimensional row-major (C order) arrays in RArrayField
+      if (arraySize.size() > 1)
+         return R__FAIL("multi-dimensional array type not supported " + normalizedType);
+      auto itemField = Create(GetNormalizedType(arrayBaseType), arrayBaseType);
+      return {std::make_unique<RArrayField>(fieldName, itemField.Unwrap(), arraySize[0])};
+   }
 
    if (normalizedType == "ROOT::Experimental::ClusterSize_t") {
       result = std::make_unique<RField<ClusterSize_t>>(fieldName);
@@ -838,7 +872,14 @@ ROOT::Experimental::RClassField::RClassField(std::string_view fieldName, std::st
          fTraits &= ~(kTraitTriviallyConstructible | kTraitTriviallyDestructible);
          continue;
       }
-      auto subField = Detail::RFieldBase::Create(dataMember->GetName(), dataMember->GetFullTypeName()).Unwrap();
+
+      std::string typeName{dataMember->GetFullTypeName()};
+      // For C-style arrays, complete the type name with the size for each dimension, e.g. `int[4][2]`
+      if (dataMember->Property() & kIsArray) {
+         for (int dim = 0, n = dataMember->GetArrayDim(); dim < n; ++dim)
+            typeName += "[" + std::to_string(dataMember->GetMaxIndex(dim)) + "]";
+      }
+      auto subField = Detail::RFieldBase::Create(dataMember->GetName(), typeName).Unwrap();
       fTraits &= subField->GetTraits();
       Attach(std::move(subField),
 	     RSubFieldInfo{kDataMember, static_cast<std::size_t>(dataMember->GetOffset())});

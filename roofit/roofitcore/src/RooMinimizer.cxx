@@ -21,8 +21,10 @@
 RooMinimizer is a wrapper class around ROOT::Fit:Fitter that
 provides a seamless interface between the minimizer functionality
 and the native RooFit interface.
-By default the Minimizer is MINUIT for classic FcnMode and MINUIT2
-for gradient FcnMode.
+By default the Minimizer is MINUIT for classic mode and MINUIT2
+for parallelized mode (activated with the `RooFit::NewStyle(true)`
+parameter or by passing a RooRealL function as the minimization
+target).
 RooMinimizer can minimize any RooAbsReal function with respect to
 its parameters. Usual choices for minimization are RooNLLVar
 and RooChi2Var
@@ -50,7 +52,6 @@ automatic PDF optimization.
 #include "RooMsgService.h"
 #include "RooPlot.h"
 #include "RooMinimizerFcn.h"
-#include "RooGradMinimizerFcn.h"
 #include "RooFitResult.h"
 #include "TestStatistics/MinuitFcnGrad.h"
 #include "RooFit/TestStatistics/RooAbsL.h"
@@ -106,36 +107,33 @@ RooMinimizer::RooMinimizer(RooAbsReal &function, Config const &cfg) : _cfg(cfg)
       if (_cfg.parallelGradient || _cfg.parallelLikelihood) { // new test statistic with multiprocessing library with
                                                               // parallel likelihood or parallel gradient
 #ifdef R__HAS_ROOFIT_MULTIPROCESS
-         if (!_cfg.parallelGradient)
+         if (!_cfg.parallelGradient) {
+            // Note that this is necessary because there is currently no serial-mode LikelihoodGradientWrapper.
+            // We intend to repurpose RooGradMinimizerFcn to build such a LikelihoodGradientSerial class.
             coutI(InputArguments) << "New style likelihood detected and likelihood parallelization requested, "
                                   << "also setting parallel gradient calculation mode." << std::endl;
-
+         }
          _fcn = std::make_unique<RooFit::TestStatistics::MinuitFcnGrad>(
             nll_real->getRooAbsL(), this, _theFitter->Config().ParamsSettings(),
             RooFit::TestStatistics::LikelihoodMode{
                static_cast<RooFit::TestStatistics::LikelihoodMode>(int(_cfg.parallelLikelihood))},
             RooFit::TestStatistics::LikelihoodGradientMode::multiprocess);
 #else
-         if (!_cfg.parallelGradient) // new test statistic without multiprocessing library with only parallel likelihood
-            throw std::logic_error(
-               "Parallel likelihood evaluation requested, but ROOT was not compiled with multiprocessing enabled, "
-               "please recompile with -Droofit_multiprocess=ON for parallel likelihood evaluation");
-         // new test statistic without multiprocessing library with parallel gradient
-         _fcn = std::make_unique<RooGradMinimizerFcn>(&function, this);
+         throw std::logic_error(
+            "Parallel likelihood or gradient evaluation requested, but ROOT was not compiled with multiprocessing enabled, "
+            "please recompile with -Droofit_multiprocess=ON for parallel evaluation");
 #endif
-      } else // new test statistic non parallel
+      } else { // new test statistic non parallel
          _fcn = std::make_unique<RooMinimizerFcn>(&function, this);
+      }
    } else {
-      if (_cfg.parallelLikelihood) // Old test statistic with parallel likelihood
+      if (_cfg.parallelLikelihood || _cfg.parallelGradient) { // Old test statistic with parallel likelihood or gradient
          throw std::logic_error("In RooMinimizer constructor: Selected likelihood evaluation but an "
                                 "old-style likelihood was given. Please supply NewStyle(true) as an "
                                 "argument to createNLL for new-style likelihoods to use likelihood "
-                                "parallelization.");
-
-      if (_cfg.parallelGradient) // Old test statistic with parallel gradient
-         _fcn = std::make_unique<RooGradMinimizerFcn>(&function, this);
-      else // Old test statistic non parallel
-         _fcn = std::make_unique<RooMinimizerFcn>(&function, this);
+                                "or gradient parallelization.");
+      }
+      _fcn = std::make_unique<RooMinimizerFcn>(&function, this);
    }
    initMinimizerFcnDependentPart(function.defaultErrorLevel());
 };
@@ -165,7 +163,7 @@ void RooMinimizer::initMinimizerFcnDependentPart(double defaultErrorLevel)
    setErrorLevel(defaultErrorLevel);
 
    // Declare our parameters to MINUIT
-   _fcn->Synchronize(_theFitter->Config().ParamsSettings(), _fcn->getOptConst());
+   _fcn->Synchronize(_theFitter->Config().ParamsSettings());
 
    // Now set default verbosity
    if (RooMsgService::instance().silentMode()) {
@@ -175,15 +173,6 @@ void RooMinimizer::initMinimizerFcnDependentPart(double defaultErrorLevel)
    }
 
    // Set user defined and default _fcn config
-   execSetters();
-}
-
-/// Execute all setters on _fcn
-void RooMinimizer::execSetters()
-{
-   setEvalErrorWall(_cfg.doEEWall);
-   setRecoverFromNaNStrength(_cfg.recoverFromNaN);
-   setPrintEvalErrors(_cfg.printEvalErrors);
    setLogFile(_cfg.logf);
 
    // Likelihood holds information on offsetting in old style, so do not set here unless explicitly set by user
@@ -306,7 +295,7 @@ bool RooMinimizer::fitFcn() const
 /// \param[in] alg  Fit algorithm to use. (Optional)
 int RooMinimizer::minimize(const char *type, const char *alg)
 {
-   _fcn->Synchronize(_theFitter->Config().ParamsSettings(), _fcn->getOptConst());
+   _fcn->Synchronize(_theFitter->Config().ParamsSettings());
 
    setMinimizerType(type);
    _theFitter->Config().SetMinimizer(type, alg);
@@ -335,7 +324,7 @@ int RooMinimizer::minimize(const char *type, const char *alg)
 
 int RooMinimizer::migrad()
 {
-   _fcn->Synchronize(_theFitter->Config().ParamsSettings(), _fcn->getOptConst());
+   _fcn->Synchronize(_theFitter->Config().ParamsSettings());
    profileStart();
    RooAbsReal::setEvalErrorLoggingMode(RooAbsReal::CollectErrors);
    RooAbsReal::clearEvalErrorLog();
@@ -366,7 +355,7 @@ int RooMinimizer::hesse()
       _status = -1;
    } else {
 
-      _fcn->Synchronize(_theFitter->Config().ParamsSettings(), _fcn->getOptConst());
+      _fcn->Synchronize(_theFitter->Config().ParamsSettings());
       profileStart();
       RooAbsReal::setEvalErrorLoggingMode(RooAbsReal::CollectErrors);
       RooAbsReal::clearEvalErrorLog();
@@ -398,7 +387,7 @@ int RooMinimizer::minos()
       _status = -1;
    } else {
 
-      _fcn->Synchronize(_theFitter->Config().ParamsSettings(), _fcn->getOptConst());
+      _fcn->Synchronize(_theFitter->Config().ParamsSettings());
       profileStart();
       RooAbsReal::setEvalErrorLoggingMode(RooAbsReal::CollectErrors);
       RooAbsReal::clearEvalErrorLog();
@@ -430,7 +419,7 @@ int RooMinimizer::minos(const RooArgSet &minosParamList)
       _status = -1;
    } else if (!minosParamList.empty()) {
 
-      _fcn->Synchronize(_theFitter->Config().ParamsSettings(), _fcn->getOptConst());
+      _fcn->Synchronize(_theFitter->Config().ParamsSettings());
       profileStart();
       RooAbsReal::setEvalErrorLoggingMode(RooAbsReal::CollectErrors);
       RooAbsReal::clearEvalErrorLog();
@@ -474,7 +463,7 @@ int RooMinimizer::minos(const RooArgSet &minosParamList)
 
 int RooMinimizer::seek()
 {
-   _fcn->Synchronize(_theFitter->Config().ParamsSettings(), _fcn->getOptConst());
+   _fcn->Synchronize(_theFitter->Config().ParamsSettings());
    profileStart();
    RooAbsReal::setEvalErrorLoggingMode(RooAbsReal::CollectErrors);
    RooAbsReal::clearEvalErrorLog();
@@ -500,7 +489,7 @@ int RooMinimizer::seek()
 
 int RooMinimizer::simplex()
 {
-   _fcn->Synchronize(_theFitter->Config().ParamsSettings(), _fcn->getOptConst());
+   _fcn->Synchronize(_theFitter->Config().ParamsSettings());
    profileStart();
    RooAbsReal::setEvalErrorLoggingMode(RooAbsReal::CollectErrors);
    RooAbsReal::clearEvalErrorLog();
@@ -526,7 +515,7 @@ int RooMinimizer::simplex()
 
 int RooMinimizer::improve()
 {
-   _fcn->Synchronize(_theFitter->Config().ParamsSettings(), _fcn->getOptConst());
+   _fcn->Synchronize(_theFitter->Config().ParamsSettings());
    profileStart();
    RooAbsReal::setEvalErrorLoggingMode(RooAbsReal::CollectErrors);
    RooAbsReal::clearEvalErrorLog();
@@ -888,27 +877,17 @@ RooFitResult *RooMinimizer::lastMinuitFit(const RooArgList &varList)
    return res;
 }
 
-void RooMinimizer::setEvalErrorWall(bool flag)
-{
-   _cfg.doEEWall = flag;
-   _fcn->SetEvalErrorWall(_cfg.doEEWall);
-}
-
-/// \copydoc RooMinimizerFcn::SetRecoverFromNaNStrength()
+/// Try to recover from invalid function values. When invalid function values
+/// are encountered, a penalty term is returned to the minimiser to make it
+/// back off. This sets the strength of this penalty. \note A strength of zero
+/// is equivalent to a constant penalty (= the gradient vanishes, ROOT < 6.24).
+/// Positive values lead to a gradient pointing away from the undefined
+/// regions. Use ~10 to force the minimiser away from invalid function values.
 void RooMinimizer::setRecoverFromNaNStrength(double strength)
 {
    _cfg.recoverFromNaN = strength;
-   _fcn->SetRecoverFromNaNStrength(_cfg.recoverFromNaN);
 }
-void RooMinimizer::setPrintEvalErrors(Int_t numEvalErrors)
-{
-   _cfg.printEvalErrors = numEvalErrors;
-   _fcn->SetPrintEvalErrors(_cfg.printEvalErrors);
-}
-void RooMinimizer::setVerbose(bool flag)
-{
-   _cfg.verbose = flag;
-}
+
 bool RooMinimizer::setLogFile(const char *logf)
 {
    _cfg.logf = logf;

@@ -2,12 +2,18 @@
 // Authors: Jonas Rembser, CERN 10/2022
 
 #include <RooConstVar.h>
-#include <RooGaussian.h>
+#include <RooDataHist.h>
+#include <RooDataSet.h>
+#include <RooFormulaVar.h>
 #include <RooGenericPdf.h>
+#include <RooHelpers.h>
+#include <RooHistPdf.h>
+#include <RooPlot.h>
 #include <RooProduct.h>
 #include <RooProjectedPdf.h>
 #include <RooRealIntegral.h>
 #include <RooRealVar.h>
+#include <RooWorkspace.h>
 
 #include <gtest/gtest.h>
 
@@ -31,18 +37,16 @@ RooArgList getSortedServers(RooAbsArg const &arg)
 // GitHub issue #11578.
 TEST(RooRealIntegral, ClientServerInterface1)
 {
-   using namespace RooFit;
-
-   RooRealVar x{"x", "", 0, 1};
-
-   RooRealVar mu{"mu", "", -0.005, -5, 5};
+   RooWorkspace ws;
 
    // This is the key in this test: the mathematically direct value server of
-   // the integral is the derived "muMod", and not the leaf of the computation
-   // graph "mu"
-   RooProduct muMod{"mu_mod", "", {mu, RooConst(10)}};
+   // the integral is the derived "mu_mod", and not the leaf of the computation
+   // graph "mu".
+   ws.factory("Product::mu_mod({mu[-0.005, -5.0, 5.0], 10.0})");
+   ws.factory("Gaussian::gauss(x[0, 1], mu_mod, 2.0)");
 
-   RooGaussian gauss{"gauss", "", x, muMod, RooConst(2.0)};
+   RooRealVar& x = *ws.var("x");
+   RooAbsPdf& gauss = *ws.pdf("gauss");
    RooGenericPdf pdf{"gaussWrapped", "gauss", gauss};
 
    std::unique_ptr<RooAbsReal> integ1{gauss.createIntegral(x, *pdf.getIntegratorConfig(), nullptr)};
@@ -106,13 +110,16 @@ TEST(RooRealIntegral, IntegrateFuncWithShapeServers)
 {
    using namespace RooFit;
 
-   RooRealVar x("x", "", 0, 1);
+   RooHelpers::LocalChangeMsgLevel chmsglvl{RooFit::WARNING, 0u, RooFit::NumIntegration, true};
 
-   RooRealVar mu("mu", "", -0.005, -5, 5);
-   RooProduct muMod("mu_mod", "", RooArgSet(mu, RooConst(10)));
-   RooRealVar sigma("sigma", "", 1, 0.5, 2);
+   RooWorkspace ws;
+   ws.factory("Product::mu_mod({mu[-0.005, -5.0, 5.0], 10.0})");
+   ws.factory("Gaussian::gauss(x[0, 1], mu_mod, sigma[1, 0.5, 2.0])");
 
-   RooGaussian gauss("gauss", "", x, muMod, sigma);
+   RooRealVar &x = *ws.var("x");
+   RooAbsReal& muMod = *ws.function("mu_mod");
+   RooRealVar& sigma = *ws.var("sigma");
+   RooAbsPdf& gauss = *ws.pdf("gauss");
    RooGenericPdf pdf("pdf", "gauss", gauss);
 
    // Project over sigma, meaning sigma should now become a shape server
@@ -144,7 +151,7 @@ TEST(RooRealIntegral, IntegrateFuncWithShapeServers)
 // Verify that using observable clones -- i.e., variables with the same names
 // as the ones in the computation graph -- does not change the client-server
 // structure of a RooRealIntegral. Covers GitHub issue #11637.
-TEST(RooRealIntegral, UseCloneAsIntegrationVariable)
+TEST(RooRealIntegral, UseCloneAsIntegrationVariable1)
 {
    RooRealVar x1{"x", "x1", -10, 10};
    RooRealVar x2{"x", "x2", -10, 10};
@@ -170,4 +177,81 @@ TEST(RooRealIntegral, UseCloneAsIntegrationVariable)
 
       EXPECT_EQ(servers.size(), 2);
    }
+}
+
+// More testing of observable clones as integration variables. This time
+// hitting the more general case where the algorithm also needs to find clients
+// of the original variable correctly ("xShifted" in this test).
+TEST(RooRealIntegral, UseCloneAsIntegrationVariable2)
+{
+   RooRealVar x1{"x", "x1", 0.0, 10};
+   RooRealVar x2{"x", "x2", 0.0, 10};
+
+   RooRealVar shift("shift", "", 0, -10, 10);
+   RooFormulaVar xShifted("x_shifted", "x + shift", {x1, shift});
+
+   RooDataHist dataHist("dataHist", "", x1);
+   RooHistPdf func("func", "", xShifted, x1, dataHist);
+
+   RooRealIntegral integ1{"integ1", "", func, x1};
+   RooRealIntegral integ2{"integ2", "", func, x2};
+
+   // Check that client-server structure is as expected.
+   for (auto const &integ : {integ1, integ2}) {
+
+      RooArgList servers{getSortedServers(integ)};
+
+      EXPECT_EQ(std::string(servers[0].GetName()), "func");
+      EXPECT_EQ(std::string(servers[1].GetName()), "shift");
+      EXPECT_EQ(std::string(servers[2].GetName()), "x");
+
+      EXPECT_FALSE(servers[0].isValueServer(integ));
+      EXPECT_TRUE(servers[1].isValueServer(integ));
+      EXPECT_FALSE(servers[2].isValueServer(integ));
+
+      EXPECT_FALSE(servers[0].isShapeServer(integ));
+      EXPECT_FALSE(servers[1].isShapeServer(integ));
+      EXPECT_TRUE(servers[2].isShapeServer(integ));
+
+      EXPECT_EQ(servers.size(), 3);
+   }
+}
+
+/// Make sure that the normalization set for a RooAddPdf is always defined when
+/// numerically integrating a RooProdPdf where the RooAddPdf is one of the
+/// factors. Covers GitHub #11476 and JIRA issue ROOT-9436.
+TEST(RooRealIntegral, Issue11476)
+{
+   // Silence the info about numeric integration because we don't care about it
+   RooHelpers::LocalChangeMsgLevel chmsglvl{RooFit::WARNING, 0u, RooFit::NumIntegration, true};
+
+   RooWorkspace ws{"ws"};
+   ws.factory("Gaussian::gs(x[0,10], mu[2, 0, 10], sg[2, 0.1, 10])");
+   ws.factory("Exponential::ex(x, lm[-0.1, -10, 0])");
+   ws.factory("SUM::gs_ex(f[0.5, 0, 1] * gs, ex)");
+   ws.factory("Gaussian::gs_1(x, mu_1[4, 0, 10], sg_1[2, 0.1, 10])");
+   ws.factory("PROD::pdf(gs_1, gs_ex)");
+
+   RooRealVar &x = *ws.var("x");
+   RooAbsPdf &pdf = *ws.pdf("pdf");
+
+   // Store the logged warnings for missing normalization sets
+   RooHelpers::HijackMessageStream hijack(RooFit::WARNING, RooFit::Eval);
+
+   std::unique_ptr<RooDataSet> data{pdf.generate(x, 10000)};
+
+   // Check that there were no warnings (covers GitHub issue #11476)
+   const std::string messages = hijack.str();
+   std::cout << messages;
+   EXPECT_TRUE(messages.empty()) << "Unexpected warnings were issued!";
+
+   // Verify that plot is correctly normalized
+   std::unique_ptr<RooPlot> frame{x.frame()};
+   data->plotOn(frame.get());
+   pdf.plotOn(frame.get());
+
+   // If the normalization of the PDF in the plot is correct, the chi-square
+   // will be low. Covers JIRA issue ROOT-9436.
+   EXPECT_LE(frame->chiSquare(), 1.0)
+      << "The chi-square of the plot is too high, the normalization of the PDF is probably wrong!";
 }

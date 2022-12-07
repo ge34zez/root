@@ -1,4 +1,4 @@
-import { gStyle, settings, isBatchMode, isFunc, isStr, browser, clTAxis } from '../core.mjs';
+import { gStyle, settings, isBatchMode, isFunc, isStr, browser, clTAxis, kNoZoom } from '../core.mjs';
 import { select as d3_select, pointer as d3_pointer, pointers as d3_pointers, drag as d3_drag } from '../d3.mjs';
 import { getActivePad, ObjectPainter, EAxisBits } from '../base/ObjectPainter.mjs';
 import { getSvgLineStyle } from '../base/TAttLineHandler.mjs';
@@ -1594,6 +1594,20 @@ class TFramePainter extends ObjectPainter {
          if (ndim > 2)
             this.applyAxisZoom('z');
       }
+
+      if (hpainter && !hpainter._checked_zooming) {
+         hpainter._checked_zooming = true;
+
+         if (hpainter.options.minimum !== kNoZoom) {
+            this.zoom_zmin = hpainter.options.minimum;
+            this.zoom_zmax = this.zmax;
+         }
+         if (hpainter.options.maximum !== kNoZoom) {
+            this.zoom_zmax = hpainter.options.maximum;
+            if (this.zoom_zmin === undefined) this.zoom_zmin = this.zmin;
+         }
+      }
+
    }
 
    /** @summary Configure secondary frame axes ranges */
@@ -2402,8 +2416,10 @@ class TFramePainter extends ObjectPainter {
 
       // do not allow log scale for labels
       if (!pad[name]) {
-         if (this.swap_xy && axis === 'x') axis = 'y'; else
-         if (this.swap_xy && axis === 'y') axis = 'x';
+         if (this.swap_xy && axis === 'x')
+            axis = 'y';
+         else if (this.swap_xy && axis === 'y')
+            axis = 'x';
          let handle = this[axis + '_handle'];
          if (handle?.kind === 'labels') return;
       }
@@ -2441,9 +2457,21 @@ class TFramePainter extends ObjectPainter {
             menu.add('endsub:');
          }
          menu.addchk(faxis.TestBit(EAxisBits.kMoreLogLabels), 'More log',
-               () => { faxis.InvertBit(EAxisBits.kMoreLogLabels); this.redrawPad(); });
+               flag => {
+                  faxis.InvertBit(EAxisBits.kMoreLogLabels);
+                  if (main?.snapid && (kind.length == 1))
+                     main.interactiveRedraw('pad', `exec:SetMoreLogLabels(${flag})`, kind);
+                  else
+                     this.interactiveRedraw('pad');
+               });
          menu.addchk(faxis.TestBit(EAxisBits.kNoExponent), 'No exponent',
-               () => { faxis.InvertBit(EAxisBits.kNoExponent); this.redrawPad(); });
+               flag => {
+                  faxis.InvertBit(EAxisBits.kNoExponent);
+                  if (main?.snapid && (kind.length == 1))
+                     main.interactiveRedraw('pad', `exec:SetNoExponent(${flag})`, kind);
+                  else
+                     this.interactiveRedraw('pad');
+               });
 
          if ((kind === 'z') && main?.options?.Zscale && isFunc(main?.fillPaletteMenu))
             main.fillPaletteMenu(menu);

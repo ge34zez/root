@@ -222,13 +222,15 @@ class TH2Painter extends TH2Painter2D {
          let pad = this.getPadPainter().getRootPad(true),
              zmult = 1 + 2*gStyle.fHistTopMargin;
 
-         this.zmin = pad && pad.fLogz ? this.gminposbin * 0.3 : this.gminbin;
-         this.zmax = this.gmaxbin;
+         if (this.draw_content || (this.gmaxbin != 0)) {
+            this.zmin = pad?.fLogz ? this.gminposbin * 0.3 : this.gminbin;
+            this.zmax = this.gmaxbin;
+         } else {
+            zmult = 1;
+         }
 
-         if (this.options.minimum !== -1111) this.zmin = this.options.minimum;
-         if (this.options.maximum !== -1111) { this.zmax = this.options.maximum; zmult = 1; }
-
-         if (pad && pad.fLogz && (this.zmin <= 0)) this.zmin = this.zmax * 1e-5;
+         if (pad?.fLogz && (this.zmin <= 0))
+            this.zmin = this.zmax * 1e-5;
 
          this.deleteAttr();
 

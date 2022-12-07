@@ -42,8 +42,8 @@ Iterator over keys in TDirectory
 class TDirectoryLevelIter : public RLevelIter {
    TDirectory *fDir{nullptr};         ///<! current directory handle
    std::unique_ptr<TIterator> fIter;  ///<! created iterator
-   Bool_t fKeysIter{kTRUE};           ///<! iterating over keys list (default)
-   Bool_t fOnlyLastCycle{kFALSE};     ///<! show only last cycle in list of keys
+   bool fKeysIter{true};              ///<! iterating over keys list (default)
+   bool fOnlyLastCycle{false};        ///<! show only last cycle in list of keys
    TKey *fKey{nullptr};               ///<! currently selected key
    TObject *fObj{nullptr};            ///<! currently selected object
    std::string fCurrentName;          ///<! current key name
@@ -86,6 +86,17 @@ class TDirectoryLevelIter : public RLevelIter {
          }
       }
       if (!fKeysIter) {
+         // exclude object with duplicated name as keys
+         while (fObj) {
+            if (!fDir->GetListOfKeys()->FindObject(fObj->GetName()))
+               break;
+            fObj = fIter->Next();
+         }
+         if (!fObj) {
+            fIter.reset();
+            return false;
+         }
+
          fCurrentName = fObj->GetName();
          return true;
       }
@@ -132,9 +143,9 @@ public:
          std::string svalue = value;
          if (svalue != undef) {
             if (svalue == "yes")
-               fOnlyLastCycle = kTRUE;
+               fOnlyLastCycle = true;
             else if (svalue == "no")
-               fOnlyLastCycle = kFALSE;
+               fOnlyLastCycle = false;
             else
                R__LOG_ERROR(ROOT::Experimental::BrowsableLog()) << "WebGui.LastCycle must be yes or no";
          }
@@ -177,11 +188,15 @@ public:
          return elem ? elem->CreateItem() : nullptr;
       }
 
-      return GetElement()->CreateItem();
+      auto item = GetDirElement(false)->CreateItem();
+      item->SetName(fCurrentName);
+      return item;
    }
 
+   std::shared_ptr<RElement> GetDirElement(bool read_dir);
+
    /** Returns full information for current element */
-   std::shared_ptr<RElement> GetElement() override;
+   std::shared_ptr<RElement> GetElement() override { return GetDirElement(true); }
 };
 
 // ===============================================================================================================
@@ -516,7 +531,7 @@ public:
 /////////////////////////////////////////////////////////////////////////////////
 /// Return element for current TKey object in TDirectory
 
-std::shared_ptr<RElement> TDirectoryLevelIter::GetElement()
+std::shared_ptr<RElement> TDirectoryLevelIter::GetDirElement(bool read_dir)
 {
    if (!fKeysIter && fObj)
       return std::make_shared<TObjectElement>(fObj);
@@ -525,7 +540,7 @@ std::shared_ptr<RElement> TDirectoryLevelIter::GetElement()
       return RProvider::BrowseNTuple(fKey->GetName(), fDir->GetFile()->GetName());
 
    std::string key_class = fKey->GetClassName();
-   if (key_class.find("TDirectory") == 0) {
+   if (read_dir && (key_class.find("TDirectory") == 0)) {
       auto subdir = fDir->GetDirectory(fKey->GetName());
       if (subdir) return std::make_shared<TDirectoryElement>("", subdir);
    }

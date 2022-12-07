@@ -30,6 +30,7 @@
 #include "TList.h"
 #include "TH1.h"
 #include "THStack.h"
+#include "TMultiGraph.h"
 #include "TEnv.h"
 #include "TError.h"
 #include "TGraph.h"
@@ -52,9 +53,25 @@
 
 Basic TCanvasImp ABI implementation for Web-based GUI
 Provides painting of main ROOT6 classes in web browsers
-Major interactive features implemented in TWebCanvasFull class.
 
 */
+
+class PadContext {
+   TVirtualPad *savedPad{nullptr};
+public:
+   PadContext(TVirtualPad *setPad = nullptr)
+   {
+      savedPad = gPad;
+      if (gPad != setPad)
+         gPad = setPad;
+   }
+   ~PadContext()
+   {
+      if (gPad != savedPad)
+         gPad = savedPad;
+   }
+};
+
 
 using namespace std::string_literals;
 
@@ -244,6 +261,29 @@ void TWebCanvas::CreateObjectSnapshot(TPadWebSnapshot &master, TPad *pad, TObjec
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////////////
+/// Calculate hash function for all colors and palette
+
+UInt_t TWebCanvas::CalculateColorsHash()
+{
+   UInt_t hash = 0;
+
+   TObjArray *colors = (TObjArray *)gROOT->GetListOfColors();
+
+   if (colors) {
+      for (Int_t n = 0; n <= colors->GetLast(); ++n)
+         if (colors->At(n))
+            hash += TString::Hash(colors->At(n), TColor::Class()->Size());
+   }
+
+   TArrayI pal = TColor::GetPalette();
+
+   hash += TString::Hash(pal.GetArray(), pal.GetSize() * sizeof(Int_t));
+
+   return hash;
+}
+
+
+//////////////////////////////////////////////////////////////////////////////////////////////////
 /// Add special canvas objects like colors list at selected palette
 
 void TWebCanvas::AddColorsPalette(TPadWebSnapshot &master)
@@ -253,13 +293,12 @@ void TWebCanvas::AddColorsPalette(TPadWebSnapshot &master)
    if (!colors)
       return;
 
-   Int_t cnt = 0;
-   for (Int_t n = 0; n <= colors->GetLast(); ++n)
-      if (colors->At(n))
-         cnt++;
-
-   if (cnt <= 598)
-      return; // normally there are 598 colors defined
+   //Int_t cnt = 0;
+   //for (Int_t n = 0; n <= colors->GetLast(); ++n)
+   //   if (colors->At(n))
+   //      cnt++;
+   //if (cnt <= 598)
+   //   return; // normally there are 598 colors defined
 
    TArrayI pal = TColor::GetPalette();
 
@@ -295,8 +334,20 @@ void TWebCanvas::CreatePadSnapshot(TPadWebSnapshot &paddata, TPad *pad, Long64_t
    paddata.SetSnapshot(TWebSnapshot::kSubPad, pad); // add ref to the pad
    paddata.SetWithoutPrimitives(!process_primitives);
 
-   if (resfunc && (GetStyleDelivery() > (version > 0 ? 1 : 0)))
-      paddata.NewPrimitive().SetSnapshot(TWebSnapshot::kStyle, gStyle);
+   // check style changes every time when creating canvas snapshot
+   if (resfunc && (GetStyleDelivery() > 0)) {
+
+      if (fStyleVersion != fCanvVersion) {
+         auto hash = TString::Hash(gStyle, TStyle::Class()->Size());
+         if ((hash != fStyleHash) || (fStyleVersion == 0)) {
+            fStyleHash = hash;
+            fStyleVersion = fCanvVersion;
+         }
+      }
+
+      if (fStyleVersion > version)
+         paddata.NewPrimitive().SetSnapshot(TWebSnapshot::kStyle, gStyle);
+   }
 
    TList *primitives = pad->GetListOfPrimitives();
 
@@ -313,14 +364,23 @@ void TWebCanvas::CreatePadSnapshot(TPadWebSnapshot &paddata, TPad *pad, Long64_t
    std::string need_title;
 
    while (process_primitives && ((obj = iter()) != nullptr)) {
+      TString opt = iter.GetOption();
+      opt.ToUpper();
+
       if (obj->InheritsFrom(THStack::Class())) {
          // workaround for THStack, create extra components before sending to client
          auto hs = static_cast<THStack *>(obj);
-         auto save = gPad;
-         Bool_t change_gpad = (gPad != pad);
-         if (change_gpad) gPad = pad;
+         PadContext ctxt(pad);
          hs->BuildPrimitives(iter.GetOption());
-         if (change_gpad) gPad = save;
+         has_histo = true;
+      } else if (obj->InheritsFrom(TMultiGraph::Class())) {
+         // workaround for TMultiGraph
+         if (opt.Contains("A")) {
+            auto mg = static_cast<TMultiGraph *>(obj);
+            PadContext ctxt;
+            mg->GetHistogram(); // force creation of histogram without any drawings
+            has_histo = true;
+         }
       } else if (obj->InheritsFrom(TFrame::Class())) {
          frame = static_cast<TFrame *>(obj);
       } else if (obj->InheritsFrom(TH1::Class())) {
@@ -329,8 +389,6 @@ void TWebCanvas::CreatePadSnapshot(TPadWebSnapshot &paddata, TPad *pad, Long64_t
          if (!obj->TestBit(TH1::kNoTitle) && (strlen(obj->GetTitle()) > 0))
             need_title = obj->GetTitle();
       } else if (obj->InheritsFrom(TGraph::Class())) {
-         TString opt = iter.GetOption();
-         opt.ToUpper();
          if (opt.Contains("A")) {
             need_frame = true;
             if (!has_histo && (strlen(obj->GetTitle()) > 0))
@@ -505,14 +563,27 @@ void TWebCanvas::CreatePadSnapshot(TPadWebSnapshot &paddata, TPad *pad, Long64_t
 
    flush_master();
 
-   bool provide_colors = GetPaletteDelivery() > 0;
-   if (GetPaletteDelivery() == 1)
-      provide_colors = !!resfunc && (version <= 0);
-   else if (GetPaletteDelivery() == 2)
-      provide_colors = !!resfunc;
+   bool provide_colors = false;
 
-   // add specials after painting is performed - new colors may be generated only during painting
-   if (provide_colors && process_primitives)
+   if ((GetPaletteDelivery() > 2) || ((GetPaletteDelivery() == 2) && resfunc)) {
+      // provide colors: either for each subpad (> 2) or only for canvas (== 2)
+      provide_colors = process_primitives;
+   } else if ((GetPaletteDelivery() == 1) && resfunc) {
+      // check that colors really changing, using hash
+
+      if (fColorsVersion != fCanvVersion) {
+         auto hash = CalculateColorsHash();
+         if ((hash != fColorsHash) || (fColorsVersion == 0)) {
+            fColorsHash = hash;
+            fColorsVersion = fCanvVersion;
+         }
+      }
+
+      provide_colors = fColorsVersion > version;
+   }
+
+   // add colors after painting is performed - new colors may be generated only during painting
+   if (provide_colors)
       AddColorsPalette(paddata);
 
    if (!resfunc)
@@ -903,9 +974,16 @@ Bool_t TWebCanvas::DecodePadOptions(const std::string &msg, bool process_execs)
 
       pad->SetFixedAspectRatio(kFALSE);
 
-      TH1 *hist = static_cast<TH1 *>(FindPrimitive("histogram", 1, pad));
+      TObjLink *objlnk = nullptr;
+
+      TH1 *hist = static_cast<TH1 *>(FindPrimitive("histogram", 1, pad, &objlnk));
 
       if (hist) {
+
+         TObject *hist_holder = objlnk ? objlnk->GetObject() : nullptr;
+         if (hist_holder == hist)
+            hist_holder = nullptr;
+
          Double_t hmin = 0., hmax = 0.;
 
          if (r.zx1 == r.zx2)
@@ -916,11 +994,6 @@ Bool_t TWebCanvas::DecodePadOptions(const std::string &msg, bool process_execs)
          if (hist->GetDimension() == 1) {
             hmin = r.zy1;
             hmax = r.zy2;
-            if ((hmin == hmax) && (hist->GetEntries() == 0.) && (hist->GetMinimumStored() != -1111.) && (hist->GetMaximumStored() != -1111.)) {
-               // special case when Y range must be set for histogram without content
-               hmin = r.uy1;
-               hmax = r.uy2;
-            }
          } else if (r.zy1 == r.zy2) {
             hist->GetYaxis()->SetRange(0., 0.);
          } else {
@@ -938,8 +1011,25 @@ Bool_t TWebCanvas::DecodePadOptions(const std::string &msg, bool process_execs)
             }
          }
 
-         if (hmin == hmax) { hist->SetMinimum(); hist->SetMaximum(); }
-                      else { hist->SetMinimum(hmin); hist->SetMaximum(hmax); }
+         if (hmin == hmax)
+            hmin = hmax = -1111;
+
+         if (!hist_holder) {
+            hist->SetMinimum(hmin);
+            hist->SetMaximum(hmax);
+         } else {
+            auto SetMember = [hist_holder](const char *name, Double_t value) {
+               auto offset = hist_holder->IsA()->GetDataMemberOffset(name);
+               if (offset > 0)
+                  *((Double_t *)((char*) hist_holder + offset)) = value;
+               else
+                  ::Error("SetMember", "Cannot find %s data member in %s", name, hist_holder->ClassName());
+            };
+
+            // directly set min/max in classes like THStack, TGraph, TMultiGraph
+            SetMember("fMinimum", hmin);
+            SetMember("fMaximum", hmax);
+         }
 
          TIter next(hist->GetListOfFunctions());
          while (auto fobj = next())
@@ -1316,7 +1406,48 @@ Bool_t TWebCanvas::ProcessData(unsigned connid, const std::string &arg)
          pad->Clear();
          pad->Modified();
          PerformUpdate();
+      } else {
+         printf("Not found pad with id %s\n", snapid.c_str());
       }
+   } else if (arg.compare(0, 7, "DIVIDE:") == 0) {
+      auto arr = TBufferJSON::FromJSON<std::vector<std::string>>(arg.substr(7));
+      if (arr && arr->size() == 2) {
+         TPad *pad = dynamic_cast<TPad *>(FindPrimitive(arr->at(0)));
+         int nn = 0, n1 = 0, n2 = 0;
+
+         std::string divide = arr->at(1);
+         auto p = divide.find('x');
+         if (p == std::string::npos)
+            p = divide.find('X');
+
+         if (p != std::string::npos) {
+            n1 = std::stoi(divide.substr(0,p));
+            n2 = std::stoi(divide.substr(p+1));
+         } else {
+            nn = std::stoi(divide);
+         }
+
+         if (pad && ((nn > 1) || (n1*n2 > 1))) {
+            pad->Clear();
+            pad->Modified();
+            if (nn > 1)
+               pad->DivideSquare(nn);
+            else
+               pad->Divide(n1, n2);
+            pad->cd(1);
+            PerformUpdate();
+         }
+      }
+
+   } else if (arg.compare(0, 8, "DRAWOPT:") == 0) {
+      auto arr = TBufferJSON::FromJSON<std::vector<std::string>>(arg.substr(8));
+      if (arr && arr->size() == 2) {
+         TObjLink *objlnk = nullptr;
+         FindPrimitive(arr->at(0), 1, nullptr, &objlnk);
+         if (objlnk)
+            objlnk->SetOption(arr->at(1).c_str());
+      }
+
    } else if (arg == "INTERRUPT"s) {
       gROOT->SetInterrupt();
    } else {
@@ -1354,11 +1485,13 @@ void TWebCanvas::CheckPadModified(TPad *pad)
 /// Check if any pad on the canvas was modified
 /// If yes, increment version of correspondent pad
 
-void TWebCanvas::CheckCanvasModified()
+void TWebCanvas::CheckCanvasModified(bool force_modified)
 {
    // clear temporary flags
-   for (auto &entry : fPadsStatus)
-      entry.second._detected = entry.second._modified = false;
+   for (auto &entry : fPadsStatus) {
+      entry.second._detected = false;
+      entry.second._modified = force_modified;
+   }
 
    // scan sub-pads
    CheckPadModified(Canvas());
@@ -1418,7 +1551,7 @@ Bool_t TWebCanvas::PerformUpdate()
 
 void TWebCanvas::ForceUpdate()
 {
-   fCanvVersion++;
+   CheckCanvasModified(true);
 
    CheckDataToSend();
 }
@@ -1588,8 +1721,7 @@ TPad *TWebCanvas::ProcessObjectOptions(TWebObjectOptions &item, TPad *pad, int i
       if (obj && obj->InheritsFrom(TPave::Class())) {
          TPave *pave = static_cast<TPave *>(obj);
          if ((item.fopt.size() >= 4) && objpad) {
-            auto save = gPad;
-            gPad = objpad;
+            PadContext ctxt(objpad);
 
             // first time need to overcome init problem
             pave->ConvertNDCtoPad();
@@ -1601,7 +1733,6 @@ TPad *TWebCanvas::ProcessObjectOptions(TWebObjectOptions &item, TPad *pad, int i
             modified = true;
 
             pave->ConvertNDCtoPad();
-            gPad = save;
          }
       }
    }
@@ -1615,7 +1746,7 @@ TPad *TWebCanvas::ProcessObjectOptions(TWebObjectOptions &item, TPad *pad, int i
 /// Also if object is in list of primitives, one could ask for entry link for such object,
 /// This can allow to change draw option
 
-TObject *TWebCanvas::FindPrimitive(const std::string &sid, int idcnt, TPad *pad, TObjLink **padlnk, TPad **objpad)
+TObject *TWebCanvas::FindPrimitive(const std::string &sid, int idcnt, TPad *pad, TObjLink **objlnk, TPad **objpad)
 {
    if (sid.empty() || (sid == "0"s))
       return nullptr;
@@ -1640,28 +1771,42 @@ TObject *TWebCanvas::FindPrimitive(const std::string &sid, int idcnt, TPad *pad,
    if (!search_hist && TString::Hash(&pad, sizeof(pad)) == id)
       return pad;
 
-   TObjLink *lnk = pad->GetListOfPrimitives()->FirstLink();
-   while (lnk) {
+   auto getHistogram = [](TObject *obj) -> TH1* {
+      auto offset = obj->IsA()->GetDataMemberOffset("fHistogram");
+      if (offset > 0)
+         return *((TH1 **)((char*) obj + offset));
+      ::Error("getHistogram", "Cannot access fHistogram data member in %s", obj->ClassName());
+      return nullptr;
+   };
+
+   for (auto lnk = pad->GetListOfPrimitives()->FirstLink(); lnk != nullptr; lnk = lnk->Next()) {
       TObject *obj = lnk->GetObject();
-      if (!obj) {
-         lnk = lnk->Next();
-         continue;
-      }
+      if (!obj) continue;
+
+      TString opt = lnk->GetOption();
+      opt.ToUpper();
+
       TH1 *h1 = obj->InheritsFrom(TH1::Class()) ? static_cast<TH1 *>(obj) : nullptr;
       TGraph *gr = obj->InheritsFrom(TGraph::Class()) ? static_cast<TGraph *>(obj) : nullptr;
+      TMultiGraph *mg = obj->InheritsFrom(TMultiGraph::Class()) ? static_cast<TMultiGraph *>(obj) : nullptr;
+      THStack *hs = obj->InheritsFrom(THStack::Class()) ? static_cast<THStack *>(obj) : nullptr;
 
       if (search_hist) {
-         if (h1) return h1;
-         if (gr) {
-            auto offset = TGraph::Class()->GetDataMemberOffset("fHistogram");
-            if (offset > 0) {
-               return *((TH1 **)((char*) gr + offset));
-            } else {
-               printf("ERROR: Cannot access fHistogram data member in TGraph\n");
-               return nullptr;
-            }
-         }
-         lnk = lnk->Next();
+         if (objlnk)
+            *objlnk = lnk;
+
+         if (h1)
+            return h1;
+         if (gr)
+            return getHistogram(gr);
+         if (mg && opt.Contains("A"))
+            return getHistogram(mg);
+         if (hs)
+            return getHistogram(hs);
+
+         if (objlnk)
+            *objlnk = nullptr;
+
          continue;
       }
 
@@ -1669,12 +1814,17 @@ TObject *TWebCanvas::FindPrimitive(const std::string &sid, int idcnt, TPad *pad,
          if (objpad)
             *objpad = pad;
 
-         if (gr && (kind.find("hist")==0)) {
-            // access to graph histogram
-            obj = h1 = gr->GetHistogram();
+         if (kind.find("hist") == 0) {
+            if (gr)
+               obj = h1 = getHistogram(gr);
+            else if (mg)
+               obj = h1 = getHistogram(mg);
+            else if (hs)
+               obj = h1 = getHistogram(hs);
+
             kind.erase(0,4);
             if (!kind.empty() && (kind[0]=='#')) kind.erase(0,1);
-            padlnk = nullptr;
+            objlnk = nullptr;
          }
 
          if (h1 && (kind == "x"))
@@ -1700,8 +1850,8 @@ TObject *TWebCanvas::FindPrimitive(const std::string &sid, int idcnt, TPad *pad,
             return nullptr;
          }
 
-         if (padlnk)
-            *padlnk = lnk;
+         if (objlnk)
+            *objlnk = lnk;
          return obj;
       }
 
@@ -1715,13 +1865,12 @@ TObject *TWebCanvas::FindPrimitive(const std::string &sid, int idcnt, TPad *pad,
                return fobj;
             }
       } else if (obj->InheritsFrom(TPad::Class())) {
-         obj = FindPrimitive(sid, idcnt, (TPad *)obj, padlnk, objpad);
+         obj = FindPrimitive(sid, idcnt, (TPad *)obj, objlnk, objpad);
          if (objpad && !*objpad)
             *objpad = pad;
          if (obj)
             return obj;
       }
-      lnk = lnk->Next();
    }
 
    return nullptr;

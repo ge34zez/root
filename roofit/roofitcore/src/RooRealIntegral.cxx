@@ -100,19 +100,16 @@ void addParameterToServers(RooAbsReal const &function, RooAbsArg &leaf, std::vec
 enum class MarkedState { Dependent, Independent, AlreadyAdded };
 
 /// Mark all args that recursively are value clients of "dep".
-/// Returns true if something was marked.
-bool unmarkDepValueClients(RooAbsArg const &dep, RooArgSet const &args, std::vector<MarkedState> &marked)
+void unmarkDepValueClients(RooAbsArg const &dep, RooArgSet const &args, std::vector<MarkedState> &marked)
 {
    assert(args.size() == marked.size());
-   auto index = args.index(dep.GetName());
+   auto index = args.index(dep);
    if (index >= 0) {
       marked[index] = MarkedState::Dependent;
       for (RooAbsArg *client : dep.valueClients()) {
          unmarkDepValueClients(*client, args, marked);
       }
-      return true;
    }
-   return false;
 }
 
 std::vector<ServerToAdd>
@@ -140,8 +137,9 @@ getValueAndShapeServers(RooAbsReal const &function, RooArgSet const &depList, co
    // it means the integration variable was in the compute graph and we will
    // add it to the server list.
    for (RooAbsArg *dep : depList) {
-      if (unmarkDepValueClients(*dep, allArgs, marked)) {
-         addObservableToServers(function, *allArgs.find(*dep), serversToAdd, rangeName);
+      if (RooAbsArg * depInArgs = allArgs.find(dep->GetName())) {
+         unmarkDepValueClients(*depInArgs, allArgs, marked);
+         addObservableToServers(function, *depInArgs, serversToAdd, rangeName);
       }
    }
 
@@ -695,10 +693,10 @@ bool RooRealIntegral::initNumIntegrator() const
   // Bind the appropriate analytic integral (specified by _mode) of our RooRealVar object to
   // those of its arguments that will be integrated out numerically.
   if(_mode != 0) {
-    _numIntegrand = std::make_unique<RooRealAnalytic>(*_function,_intList,_mode,_funcNormSet.get(),_rangeName);
+    _numIntegrand = std::make_unique<RooRealAnalytic>(*_function,_intList,_mode,funcNormSet(),_rangeName);
   }
   else {
-    _numIntegrand = std::make_unique<RooRealBinding>(*_function,_intList,_funcNormSet.get(),false,_rangeName);
+    _numIntegrand = std::make_unique<RooRealBinding>(*_function,_intList,funcNormSet(),false,_rangeName);
   }
   if(0 == _numIntegrand || !_numIntegrand->isValid()) {
     coutE(Integration) << ClassName() << "::" << GetName() << ": failed to create valid integrand." << std::endl;
@@ -918,7 +916,7 @@ double RooRealIntegral::evaluate() const
       assert(servers().size() == _facList.size() + 1);
 
       //setDirtyInhibit(true) ;
-      retVal= _function->getVal(_funcNormSet.get()) ;
+      retVal= _function->getVal(funcNormSet());
       //setDirtyInhibit(false) ;
       break ;
     }
